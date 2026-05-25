@@ -330,38 +330,43 @@ collect_k8s() {
     local pods_json
     pods_json=$(kubectl get pods -n "$NAMESPACE" -o json 2>/dev/null || echo '{"items":[]}')
 
-    # kubectl top требует metrics-server
+    # kubectl top --containers требует metrics-server; ключ — "pod/container"
     local top_data="{}"
-    if kubectl top pods -n "$NAMESPACE" --no-headers 2>/dev/null | head -1 | grep -q '.'; then
-        top_data=$(kubectl top pods -n "$NAMESPACE" --no-headers 2>/dev/null \
-            | awk '{print "{\"" $1 "\": {\"cpu_usage\": \"" $2 "\", \"mem_usage\": \"" $3 "\"}}"}' \
+    if kubectl top pod -n "$NAMESPACE" --containers --no-headers 2>/dev/null | head -1 | grep -q '.'; then
+        top_data=$(kubectl top pod -n "$NAMESPACE" --containers --no-headers 2>/dev/null \
+            | awk '{print "{\"" $1 "/" $2 "\": {\"cpu\": \"" $3 "\", \"mem\": \"" $4 "\"}}"}' \
             | jq -sc 'add // {}' 2>/dev/null || echo "{}")
     fi
 
     local pods
     pods=$(echo "$pods_json" | jq --argjson top "$top_data" '[.items[] |
         .metadata.name as $pod_name |
+        (.spec.containers | map({(.name): {
+            cpu_req: (.resources.requests.cpu    // ""),
+            cpu_lim: (.resources.limits.cpu      // ""),
+            mem_req: (.resources.requests.memory // ""),
+            mem_lim: (.resources.limits.memory   // "")
+        }}) | add // {}) as $spec |
         {
             name: $pod_name,
             phase: .status.phase,
             ready: ([ .status.containerStatuses[]?.ready ] | all),
             restarts: ([.status.containerStatuses[]?.restartCount] | add // 0),
             node: .spec.nodeName,
-            status: .status.phase,
             containers: [.status.containerStatuses[]? | .name as $cname |
                 {
-                    name: .name,
-                    ready: .ready,
-                    restarts: .restartCount,
-                    last_state: (.lastState.terminated.reason // "")
+                    name:       $cname,
+                    ready:      .ready,
+                    restarts:   .restartCount,
+                    last_state: (.lastState.terminated.reason // ""),
+                    cpu_req:    ($spec[$cname].cpu_req // ""),
+                    cpu_lim:    ($spec[$cname].cpu_lim // ""),
+                    mem_req:    ($spec[$cname].mem_req // ""),
+                    mem_lim:    ($spec[$cname].mem_lim // ""),
+                    cpu_now:    ($top["\($pod_name)/\($cname)"].cpu // ""),
+                    mem_now:    ($top["\($pod_name)/\($cname)"].mem // "")
                 }
-            ],
-            cpu_request:    ([ .spec.containers[]? | .resources.requests.cpu    // "" ] | first // ""),
-            cpu_limit:      ([ .spec.containers[]? | .resources.limits.cpu      // "" ] | first // ""),
-            memory_request: ([ .spec.containers[]? | .resources.requests.memory // "" ] | first // ""),
-            memory_limit:   ([ .spec.containers[]? | .resources.limits.memory   // "" ] | first // ""),
-            cpu_usage:      ($top[$pod_name].cpu_usage // ""),
-            mem_usage:      ($top[$pod_name].mem_usage // "")
+            ]
         }
     ]' 2>/dev/null || echo "[]")
 
@@ -496,27 +501,38 @@ collect_logs() {
     log "Логи сервисов (error/fatal)..."
     local result="{}"
 
+    # Фильтрация error/fatal по label tier=elma365 — идентично старому скрипту
+    local tmp_err
+    tmp_err=$(mktemp)
+    kubectl logs -n "$NAMESPACE" \
+        -l tier=elma365 --all-containers \
+        --tail=500 2>/dev/null \
+        | grep -E '"level":"(fatal|error)"|"(fatal|error)"|level=(fatal|error)| ERROR | FATAL ' \
+        | tail -300 > "$tmp_err" || true
+    result=$(echo "$result" | jq \
+        --rawfile v "$tmp_err" \
+        '. + {"__elma_errors": $v}')
+    rm -f "$tmp_err"
+
+    # Последние 100 строк каждого пода для быстрого просмотра в HTML
     local pods
     pods=$(kubectl get pods -n "$NAMESPACE" \
         --field-selector=status.phase=Running \
         -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
     for pod in $pods; do
-        local pod_logs
-        pod_logs=$(kubectl logs "$pod" -n "$NAMESPACE" \
-            --tail=200 2>/dev/null \
-            | tail -100 || echo "")
+        local tmp_log
+        tmp_log=$(mktemp)
+        kubectl logs "$pod" -n "$NAMESPACE" \
+            --tail=100 2>/dev/null > "$tmp_log" || true
 
-        if [[ -n "$pod_logs" ]]; then
-            local tmp_log
-            tmp_log=$(mktemp)
-            printf '%s' "$pod_logs" > "$tmp_log"
+        if [[ -s "$tmp_log" ]]; then
             result=$(echo "$result" | jq \
                 --arg pod "$pod" \
                 --rawfile logs "$tmp_log" \
                 '. + {($pod): $logs}')
-            rm -f "$tmp_log"
         fi
+        rm -f "$tmp_log"
     done
 
     echo "$result"
@@ -1394,36 +1410,39 @@ function sectionCluster(a, raw) {
     ${crashed > 0 ? `
     <h3 class="sub-title warn-title">Проблемные поды</h3>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Под</th><th>Рестартов</th><th>Причина</th><th>CPU лимит</th><th>CPU сейчас</th><th>Память лимит</th><th>Память сейчас</th></tr></thead>
+      <thead><tr><th>Под</th><th>Контейнер</th><th>Рестартов</th><th>Причина</th><th>CPU req/lim</th><th>CPU сейчас</th><th>RAM req/lim</th><th>RAM сейчас</th></tr></thead>
       <tbody>
         ${pods.filter(p => (p.restarts || 0) > 5 || (p.containers || []).some(c => c.last_state === 'OOMKilled'))
-          .map(p => `<tr>
-            <td><b>${p.name}</b></td>
-            <td class="err">${p.restarts || 0}</td>
-            <td class="err">${(p.containers || []).map(c => c.last_state).filter(Boolean).join(', ') || '—'}</td>
-            <td>${p.cpu_limit || '—'}</td>
-            <td>${p.cpu_usage || '—'}</td>
-            <td>${p.memory_limit || '—'}</td>
-            <td>${p.mem_usage || '—'}</td>
+          .flatMap(p => (p.containers || []).map(c => ({ pod: p.name, c })))
+          .map(({ pod, c }) => `<tr>
+            <td><b>${pod}</b></td>
+            <td>${c.name}</td>
+            <td class="${(c.restarts || 0) > 5 ? 'err' : (c.restarts || 0) > 0 ? 'warn' : ''}">${c.restarts || 0}</td>
+            <td class="${c.last_state === 'OOMKilled' ? 'err' : ''}">${c.last_state || '—'}</td>
+            <td style="font-size:12px">${c.cpu_req || '—'} / ${c.cpu_lim || '—'}</td>
+            <td style="font-size:12px">${c.cpu_now || '—'}</td>
+            <td style="font-size:12px">${c.mem_req || '—'} / ${c.mem_lim || '—'}</td>
+            <td style="font-size:12px">${c.mem_now || '—'}</td>
           </tr>`).join('')}
       </tbody>
     </table></div>` : ''}
 
     <h3 class="sub-title">Все поды</h3>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Статус</th><th>Под</th><th>Рестартов</th><th>CPU лимит</th><th>CPU сейчас</th><th>Память лимит</th><th>Память сейчас</th><th>Нода</th></tr></thead>
+      <thead><tr><th>Статус</th><th>Под</th><th>Контейнер</th><th>Рестартов</th><th>CPU req/lim</th><th>CPU сейчас</th><th>RAM req/lim</th><th>RAM сейчас</th><th>Нода</th></tr></thead>
       <tbody>
-        ${pods.map(p => {
+        ${pods.flatMap(p => (p.containers || []).map((c, i) => ({ p, c, i }))).map(({ p, c, i }) => {
           const ok = p.ready && (p.restarts || 0) <= 5;
           return `<tr>
-            <td><span class="dot ${ok ? 'ok' : 'err'}"></span></td>
-            <td>${p.name}</td>
-            <td class="${(p.restarts || 0) > 5 ? 'err' : (p.restarts || 0) > 0 ? 'warn' : ''}">${p.restarts || 0}</td>
-            <td style="font-size:12px">${p.cpu_limit || '—'}</td>
-            <td style="font-size:12px">${p.cpu_usage || '—'}</td>
-            <td style="font-size:12px">${p.memory_limit || '—'}</td>
-            <td style="font-size:12px">${p.mem_usage || '—'}</td>
-            <td style="font-size:12px;color:var(--muted)">${p.node || '—'}</td>
+            <td>${i === 0 ? `<span class="dot ${ok ? 'ok' : 'err'}"></span>` : ''}</td>
+            <td>${i === 0 ? p.name : ''}</td>
+            <td style="color:var(--muted)">${c.name}</td>
+            <td class="${(c.restarts || 0) > 5 ? 'err' : (c.restarts || 0) > 0 ? 'warn' : ''}">${c.restarts || 0}</td>
+            <td style="font-size:12px">${c.cpu_req || '—'} / ${c.cpu_lim || '—'}</td>
+            <td style="font-size:12px">${c.cpu_now || '—'}</td>
+            <td style="font-size:12px">${c.mem_req || '—'} / ${c.mem_lim || '—'}</td>
+            <td style="font-size:12px">${c.mem_now || '—'}</td>
+            <td style="font-size:12px;color:var(--muted)">${i === 0 ? (p.node || '—') : ''}</td>
           </tr>`;
         }).join('')}
       </tbody>
@@ -1848,12 +1867,21 @@ function sectionAuth(a, raw) {
 }
 
 function sectionLogs(raw) {
-  const logs = raw.logs || {};
-  const pods = Object.keys(logs);
+  const logs    = raw.logs || {};
+  const elmaErr = logs.__elma_errors || '';
+  const pods    = Object.keys(logs).filter(k => k !== '__elma_errors');
 
   return `
   <section id="s-logs" class="report-section">
     <h2 class="section-title">Логи сервисов</h2>
+
+    ${elmaErr.trim() ? `
+    <h3 class="sub-title warn-title">ELMA365 — error / fatal (tier=elma365)</h3>
+    <p class="section-hint">Отфильтровано из всех подов с меткой <code>tier=elma365</code>.</p>
+    <div class="log-box">${fmtLogs(elmaErr)}</div>` :
+    `<div class="tip-box" style="margin-bottom:16px">Ошибок уровня error/fatal в подах <code>tier=elma365</code> не найдено.</div>`}
+
+    <h3 class="sub-title">Последние строки по подам</h3>
     <p class="section-hint">
       Строки <span class="tag err-tag">error</span> и <span class="tag err-tag">fatal</span> — ошибки, требуют внимания.
       Строки <span class="tag">debug</span> — нормальная работа, можно игнорировать.
