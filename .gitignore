@@ -1,0 +1,4 @@
+*.json.gz
+*.html
+elma365-report-*
+elma365-diagnostics-*
